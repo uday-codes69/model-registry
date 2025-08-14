@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Khan/genqlient/graphql"
-	"github.com/golang/glog"
 	"github.com/kubeflow/model-registry/catalog/internal/catalog/genqlient"
 	"github.com/kubeflow/model-registry/catalog/pkg/openapi"
+	model "github.com/kubeflow/model-registry/catalog/pkg/openapi"
 	models "github.com/kubeflow/model-registry/catalog/pkg/openapi"
 )
 
@@ -22,9 +25,8 @@ type rhecModel struct {
 
 // rhecCatalogConfig defines the structure of the RHEC catalog configuration.
 type rhecCatalogConfig struct {
-	Models []struct {
-		Repository string `yaml:"repository"`
-	} `yaml:"models"`
+	Models         []string `yaml:"models"`
+	ExcludedModels []string `yaml:"excludedModels"`
 }
 
 type rhecCatalogImpl struct {
@@ -50,22 +52,79 @@ func (r *rhecCatalogImpl) ListModels(ctx context.Context, params ListModelsParam
 	r.modelsLock.RLock()
 	defer r.modelsLock.RUnlock()
 
-	items := make([]openapi.CatalogModel, 0, len(r.models))
+	var filteredModels []*model.CatalogModel
 	for _, rm := range r.models {
-		items = append(items, rm.CatalogModel)
+		cm := rm.CatalogModel
+		if params.Query != "" {
+			query := strings.ToLower(params.Query)
+			// Check if query matches name, description, tasks, provider, or libraryName
+			if !strings.Contains(strings.ToLower(cm.Name), query) &&
+				!strings.Contains(strings.ToLower(cm.GetDescription()), query) &&
+				!strings.Contains(strings.ToLower(cm.GetProvider()), query) &&
+				!strings.Contains(strings.ToLower(cm.GetLibraryName()), query) {
+
+				// Check tasks
+				foundInTasks := false
+				for _, task := range cm.GetTasks() { // Use GetTasks() for nil safety
+					if strings.Contains(strings.ToLower(task), query) {
+						foundInTasks = true
+						break
+					}
+				}
+				if !foundInTasks {
+					continue // Skip if no match in any searchable field
+				}
+			}
+		}
+		filteredModels = append(filteredModels, &cm)
 	}
 
-	count := len(items)
+	// Sort the filtered models
+	sort.Slice(filteredModels, func(i, j int) bool {
+		a := filteredModels[i]
+		b := filteredModels[j]
+
+		var less bool
+		switch params.OrderBy {
+		case model.ORDERBYFIELD_CREATE_TIME:
+			// Convert CreateTimeSinceEpoch (string) to int64 for comparison
+			// Handle potential nil or conversion errors by treating as 0
+			aTime, _ := strconv.ParseInt(a.GetCreateTimeSinceEpoch(), 10, 64)
+			bTime, _ := strconv.ParseInt(b.GetCreateTimeSinceEpoch(), 10, 64)
+			less = aTime < bTime
+		case model.ORDERBYFIELD_LAST_UPDATE_TIME:
+			// Convert LastUpdateTimeSinceEpoch (string) to int64 for comparison
+			// Handle potential nil or conversion errors by treating as 0
+			aTime, _ := strconv.ParseInt(a.GetLastUpdateTimeSinceEpoch(), 10, 64)
+			bTime, _ := strconv.ParseInt(b.GetLastUpdateTimeSinceEpoch(), 10, 64)
+			less = aTime < bTime
+		case model.ORDERBYFIELD_NAME:
+			fallthrough
+		default:
+			// Fallback to name sort if an unknown sort field is provided
+			less = strings.Compare(a.Name, b.Name) < 0
+		}
+
+		if params.SortOrder == model.SORTORDER_DESC {
+			return !less
+		}
+		return less
+	})
+
+	count := len(filteredModels)
 	if count > math.MaxInt32 {
 		count = math.MaxInt32
 	}
 
-	return openapi.CatalogModelList{
-		Items:         items,
-		PageSize:      int32(count),
-		Size:          int32(count),
-		NextPageToken: "",
-	}, nil
+	list := model.CatalogModelList{
+		Items:    make([]model.CatalogModel, count),
+		PageSize: int32(count),
+		Size:     int32(count),
+	}
+	for i := range list.Items {
+		list.Items[i] = *filteredModels[i]
+	}
+	return list, nil // Return the struct value directly
 }
 
 func (r *rhecCatalogImpl) GetArtifacts(ctx context.Context, name string) (*openapi.CatalogModelArtifactList, error) {
@@ -160,7 +219,7 @@ func newRhecModel(repoData *genqlient.GetRepositoryResponse, imageData genqlient
 		},
 		Artifacts: []*openapi.CatalogModelArtifact{
 			{
-				Uri:                      "registry.redhat.io/" + repositoryName + ":" + imageTagName,
+				Uri:                      "oci://registry.redhat.io/" + repositoryName + ":" + imageTagName,
 				CreateTimeSinceEpoch:     &imageCreationDate,
 				LastUpdateTimeSinceEpoch: &imageLastUpdateDate,
 			},
@@ -168,23 +227,12 @@ func newRhecModel(repoData *genqlient.GetRepositoryResponse, imageData genqlient
 	}
 }
 
-func (r *rhecCatalogImpl) load(modelsList []any) error {
+func (r *rhecCatalogImpl) load(modelsList []string, excludedModelsList []string) error {
 	graphqlClient := graphql.NewClient("https://catalog.redhat.com/api/containers/graphql/", http.DefaultClient)
 	ctx := context.Background()
 
 	models := make(map[string]*rhecModel)
-	for _, modelEntry := range modelsList {
-		modelMap, ok := modelEntry.(map[string]any)
-		if !ok {
-			glog.Warningf("skipping invalid entry in 'models' list")
-			continue
-		}
-		repo, ok := modelMap["repository"].(string)
-		if !ok {
-			glog.Warningf("skipping model with missing or invalid 'repository'")
-			continue
-		}
-
+	for _, repo := range modelsList {
 		repoData, err := fetchRepository(ctx, graphqlClient, repo)
 		if err != nil {
 			return err
@@ -200,6 +248,11 @@ func (r *rhecCatalogImpl) load(modelsList []any) error {
 				for _, imageTag := range imageRepository.Tags {
 					tagName := imageTag.Name
 					fullModelName := repo + ":" + tagName
+
+					if isModelExcluded(fullModelName, excludedModelsList) {
+						continue
+					}
+
 					model := newRhecModel(repoData, image, tagName, repo)
 					models[fullModelName] = model
 				}
@@ -214,6 +267,19 @@ func (r *rhecCatalogImpl) load(modelsList []any) error {
 	return nil
 }
 
+func isModelExcluded(modelName string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if strings.HasSuffix(pattern, "*") {
+			if strings.HasPrefix(modelName, strings.TrimSuffix(pattern, "*")) {
+				return true
+			}
+		} else if modelName == pattern {
+			return true
+		}
+	}
+	return false
+}
+
 func newRhecCatalog(source *CatalogSourceConfig) (CatalogSourceProvider, error) {
 	modelsData, ok := source.Properties["models"]
 	if !ok {
@@ -225,11 +291,35 @@ func newRhecCatalog(source *CatalogSourceConfig) (CatalogSourceProvider, error) 
 		return nil, fmt.Errorf("'models' property should be a list")
 	}
 
+	models := make([]string, len(modelsList))
+	for i, v := range modelsList {
+		models[i], ok = v.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid entry in 'models' list, expected a string")
+		}
+	}
+
+	// Excluded models is an optional source property.
+	var excludedModels []string
+	if excludedModelsData, ok := source.Properties["excludedModels"]; ok {
+		excludedModelsList, ok := excludedModelsData.([]any)
+		if !ok {
+			return nil, fmt.Errorf("'excludedModels' property should be a list")
+		}
+		excludedModels = make([]string, len(excludedModelsList))
+		for i, v := range excludedModelsList {
+			excludedModels[i], ok = v.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid entry in 'excludedModels' list, expected a string")
+			}
+		}
+	}
+
 	r := &rhecCatalogImpl{
 		models: make(map[string]*rhecModel),
 	}
 
-	err := r.load(modelsList)
+	err := r.load(models, excludedModels)
 	if err != nil {
 		return nil, fmt.Errorf("error loading rhec catalog: %w", err)
 	}
